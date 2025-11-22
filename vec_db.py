@@ -36,7 +36,7 @@ SAMPLE_SIZE = 500_000
 
 class VecDB:
     def __init__(self, database_file_path="saved_db.dat", index_file_path="index.dat",
-                 new_db=True, db_size=None) -> None:
+                 new_db=True, db_size=None, new_index = True) -> None:
         self.db_path = database_file_path
         self.index_path = index_file_path
         os.makedirs(self.index_path, exist_ok=True)
@@ -48,6 +48,8 @@ class VecDB:
             if os.path.exists(self.db_path):
                 os.remove(self.db_path)
             self.generate_database(db_size)
+        if new_index:
+            self._build_index()
 
     def generate_database(self, size: int) -> None:
         rng = np.random.default_rng(DB_SEED_NUMBER)

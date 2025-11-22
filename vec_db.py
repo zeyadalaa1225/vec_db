@@ -20,9 +20,9 @@ IVF_CONFIGS = {
 # PQ M (Dimensionality of vector after applying PQ) choice
 PQ_M_CONFIGS = {
     1_000_000: 32,      
-    10_000_000: 8,
-    15_000_000: 8,
-    20_000_000: 8       
+    10_000_000: 32,
+    15_000_000: 32,
+    20_000_000: 32       
 }
 ## de mesh mofeda zeyadetha asl wana batrain batrain 3ala 500000 kda kda fa mesh hyfe2 we wana baretrieve be retreive 3ala probe_cluster fe 3add el el data ele gowa kol cluster
 # ele howa 8aleban bardo 3add sabet 34an 3add el ivf clusters byzed ma3a el size

@@ -51,29 +51,29 @@ class VecDB:
         if new_index:
             self._build_index()
 
-    def generate_database(self, size: int) -> None:
-        rng = np.random.default_rng(DB_SEED_NUMBER)
-        vectors = rng.random((size, DIMENSION), dtype=np.float32)
-        self._write_vectors_to_file(vectors)
-        self._build_index()
+    # def generate_database(self, size: int) -> None:
+    #     rng = np.random.default_rng(DB_SEED_NUMBER)
+    #     vectors = rng.random((size, DIMENSION), dtype=np.float32)
+    #     self._write_vectors_to_file(vectors)
+    #     self._build_index()
 
-    def _write_vectors_to_file(self, vectors: np.ndarray) -> None:
-        mmap_vectors = np.memmap(self.db_path, dtype=np.float32, mode='w+', shape=vectors.shape)
-        mmap_vectors[:] = vectors[:]
-        mmap_vectors.flush()
+    # def _write_vectors_to_file(self, vectors: np.ndarray) -> None:
+    #     mmap_vectors = np.memmap(self.db_path, dtype=np.float32, mode='w+', shape=vectors.shape)
+    #     mmap_vectors[:] = vectors[:]
+    #     mmap_vectors.flush()
 
-    def _get_num_records(self) -> int:
-        return os.path.getsize(self.db_path) // (DIMENSION * ELEMENT_SIZE)
+    # def _get_num_records(self) -> int:
+    #     return os.path.getsize(self.db_path) // (DIMENSION * ELEMENT_SIZE)
 
-    def insert_records(self, rows: Annotated[np.ndarray, (int, DIMENSION)]):
-        num_old_records = self._get_num_records()
-        num_new_records = len(rows)
-        full_shape = (num_old_records + num_new_records, DIMENSION)
-        mmap_vectors = np.memmap(self.db_path, dtype=np.float32, mode='r+', shape=full_shape)
-        mmap_vectors[num_old_records:] = rows
-        mmap_vectors.flush()
-        #TODO: might change to call insert in the index, if you need
-        self._build_index()
+    # def insert_records(self, rows: Annotated[np.ndarray, (int, DIMENSION)]):
+    #     num_old_records = self._get_num_records()
+    #     num_new_records = len(rows)
+    #     full_shape = (num_old_records + num_new_records, DIMENSION)
+    #     mmap_vectors = np.memmap(self.db_path, dtype=np.float32, mode='r+', shape=full_shape)
+    #     mmap_vectors[num_old_records:] = rows
+    #     mmap_vectors.flush()
+    #     #TODO: might change to call insert in the index, if you need
+    #     self._build_index()
 
     def get_one_row(self, row_num: int) -> np.ndarray:
         # This function is only load one row in memory

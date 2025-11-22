@@ -141,6 +141,7 @@ class VecDB:
 
         # normalize sample rows (so PQ approximates cosine reasonably)
         sample_norms = np.linalg.norm(sample, axis=1, keepdims=True)
+        sample_norms[sample_norms == 0] = 1.0
         sample = sample / sample_norms
 
         '''
@@ -158,6 +159,7 @@ class VecDB:
         centroids = kmeans_ivf.cluster_centers_.astype(np.float32)
         # normalize centroids
         c_norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+        c_norms[c_norms == 0] = 1.0
         centroids = centroids / c_norms
         
         np.save(os.path.join(self.index_path,"centroids.npy"), centroids)
@@ -203,6 +205,7 @@ class VecDB:
 
             # normalize chunk
             norms = np.linalg.norm(chunk, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
             chunk_norm = chunk / norms  
 
             # compute similarity to centroids (dot product because normalized)

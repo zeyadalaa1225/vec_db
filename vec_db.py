@@ -33,7 +33,7 @@ CHUNK_SIZE = 5_000
 
 class VecDB:
     def __init__(self, database_file_path="saved_db.dat", index_file_path="index.dat",
-                 new_db=True, db_size=None, new_index = True) -> None:
+                 new_db=True, db_size=None, new_index = False) -> None:
         self.db_path = database_file_path
         self.index_path = index_file_path
         os.makedirs(self.index_path, exist_ok=True)

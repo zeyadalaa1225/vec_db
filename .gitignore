@@ -5,3 +5,4 @@ __pycache__
 *.dat
 *.bin
 *.npz
+*index*

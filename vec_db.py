@@ -2,42 +2,34 @@ from typing import Annotated, Dict
 import numpy as np
 import os
 import struct
-from sklearn.cluster import MiniBatchKMeans
+from sklearn.cluster import KMeans, MiniBatchKMeans
+import heapq
+import gc
 
-DB_SEED_NUMBER = 42
 ELEMENT_SIZE = np.dtype(np.float32).itemsize
 DIMENSION = 64
-TOP_K_DEFAULT = 5
+DB_SEED_NUMBER = 42
+
 
 # IVF number of clusters based on db size
 IVF_CONFIGS = {
-    1_000_000: 4096,      
-    10_000_000: 8192,    
-    15_000_000: 12288,   
-    20_000_000: 16384     
+    1_000_000: 4096,
+    10_000_000: 8192,
+    20_000_000: 16384
 }
 
-# PQ M (Dimensionality of vector after applying PQ) choice
-PQ_M_CONFIGS = {
-    1_000_000: 32,      
-    10_000_000: 8,
-    15_000_000: 8,
-    20_000_000: 8       
-}
+
 ## de mesh mofeda zeyadetha asl wana batrain batrain 3ala 500000 kda kda fa mesh hyfe2 we wana baretrieve be retreive 3ala probe_cluster fe 3add el el data ele gowa kol cluster
 # ele howa 8aleban bardo 3add sabet 34an 3add el ivf clusters byzed ma3a el size
 # Number of clusters to probe
 PROBE_CLUSTERS_CONFIGS = {
-    1_000_000: 60,
-    10_000_000: 120,
-    15_000_000: 180,
-    20_000_000: 240
+    1_000_000: 10,
+    10_000_000: 10,
+    20_000_000: 10
 }
 
 # Chunking and sampling for build phase
-CHUNK_SIZE = 10_000
-SAMPLE_SIZE = 500_000
-
+CHUNK_SIZE = 5_000
 
 class VecDB:
     def __init__(self, database_file_path="saved_db.dat", index_file_path="index.dat",
@@ -101,10 +93,6 @@ class VecDB:
         closest = min(IVF_CONFIGS.keys(), key=lambda x: abs(x - num_records))
         return IVF_CONFIGS[closest]
 
-    def _choose_pq_m(self, num_records):
-        closest = min(PQ_M_CONFIGS.keys(), key=lambda x: abs(x - num_records))
-        return PQ_M_CONFIGS[closest]
-
     def _build_index(self):
         """
         Build IVF + PQ index from on-disk vectors.
@@ -119,157 +107,87 @@ class VecDB:
             raise RuntimeError("No vectors to index")
 
         n_clusters = self._choose_n_clusters(num_records)
-        M = self._choose_pq_m(num_records)
 
-        # divide into M subvectors each with (DIMENSION//M) dimensionality
-        # to account for M not divisible by DIMENSION add 1 from the remainder to each subvector dimensionality
-        subdims = []
-        base = DIMENSION // M
-        rem = DIMENSION % M
-        for i in range(M):
-            subdims.append(base + (1 if i < rem else 0))
+        print(f"Building IVF: N={num_records}, clusters={n_clusters}")
 
-        print(f"Building IVF+PQ: N={num_records}, clusters={n_clusters}, PQ M={M}, subdims={subdims}")
+        # -------------------- step 1: load data --------------------
+        db = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
 
-        # -------------------- step 1: sample data --------------------
-        samp = min(SAMPLE_SIZE, num_records)
-
-        #TODO: Expirement with different sampling methods instead of random
-        rng = np.random.default_rng(DB_SEED_NUMBER)
-        sample_idxs = rng.choice(num_records, size=samp, replace=False)
-
-        #TODO: GPT picked sample size as to make it fit in memory see if you can increase it 
-
-        # load sample
-        mm = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
-        sample = np.array(mm[sample_idxs])  # fits in memory (SAMPLE_SIZE x DIM)
-
-        # normalize sample rows (so PQ approximates cosine reasonably)
-        sample_norms = np.linalg.norm(sample, axis=1, keepdims=True)
-        sample_norms[sample_norms == 0] = 1.0
-        sample = sample / sample_norms
-
-        '''
-        ana hena ba5tar random sample_size rows we ba3mel le kol wa7ed normalization ele howa
-        ba2sem 3al length aw el magnitude 34an wana bamatch fel pq a2der a3mel dot product 3ala tol
-
-        '''
-
+        db_magnitude = np.linalg.norm(db, axis=1, keepdims=True)
+        # non_zero_mask = (db_magnitude[:,0] != 0)
+        # db = db[non_zero_mask] / db_magnitude[non_zero_mask]
+        db_magnitude[db_magnitude == 0] = 1
+        db = db / db_magnitude
+        
         # -------------------- step 2: train IVF centroids --------------------
         print("Training MiniBatchKMeans for centroids...")
 
-        #TODO: Try to increase batch_size
-        kmeans_ivf = MiniBatchKMeans(n_clusters=n_clusters, random_state=DB_SEED_NUMBER, batch_size=4096, n_init="auto")
-        kmeans_ivf.fit(sample)
+        kmeans_ivf = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, batch_size=10_000, n_init="auto")
+        kmeans_ivf.fit(db)
         centroids = kmeans_ivf.cluster_centers_.astype(np.float32)
-        # normalize centroids
+
+        # kmeans_ivf = KMeans(
+        #   n_clusters=n_clusters,
+        #   random_state=DB_SEED_NUMBER,
+        #   n_init="auto",
+        #   max_iter=300,
+        #   algorithm="lloyd"
+        # )
+        # kmeans_ivf.fit(sample)
+        # centroids = kmeans_ivf.cluster_centers_.astype(np.float32)
+
         c_norms = np.linalg.norm(centroids, axis=1, keepdims=True)
-        c_norms[c_norms == 0] = 1.0
         centroids = centroids / c_norms
-        
-        np.save(os.path.join(self.index_path,"centroids.npy"), centroids)
+
+        centroids.tofile(os.path.join(self.index_path, "centroids.bin"))
         print("Centroids saved.")
 
-        # -------------------- step 3: train PQ codebooks (per subspace) --------------------
-        print("Training PQ codebooks...")
-        pq_codebooks = []
-        start_idx = 0
-        for sd in subdims:
-            subspace = sample[:, start_idx:start_idx + sd]
+        # # -------------------- step 3: assign vectors in chunks --------------------
+        # centroids = np.fromfile(self.index_path + "/centroids.bin", dtype=np.float32).reshape((n_clusters, DIMENSION))
+        cluster_files = [
+            open(os.path.join(self.index_path, f"cluster_{cid}.bin"), "ab")
+            for cid in range(n_clusters)
+        ]
 
-            #TODO: Try to increase the number of clusters and batch_size
-            kmeans_pq = MiniBatchKMeans(n_clusters=256, random_state=DB_SEED_NUMBER, batch_size=4096, n_init="auto")
-            kmeans_pq.fit(subspace)
-            codebook = kmeans_pq.cluster_centers_.astype(np.float32)
-            #TODO: Try and normalize the codebooks
-
-            pq_codebooks.append(codebook)
-            start_idx += sd
-
-        # Save PQ codebooks as a single .npz for convenience
-        np.savez(os.path.join(self.index_path, "pq_codebooks.npz"), *pq_codebooks)
-        print("PQ codebooks saved.")#(265,32)
-
-        # -------------------- step 4: create empty cluster files and counts --------------------
-        cluster_counts = np.zeros(n_clusters, dtype=np.uint32)   
-        cluster_paths = [os.path.join(self.index_path,f"cluster_{i}.bin") for i in range(n_clusters)]
-        # create (truncate) files
-        for p in cluster_paths:
-            open(p, "wb").close()
-
-        # -------------------- step 5: assign vectors in chunks and encode PQ codes --------------------
-        print("Assigning and encoding vectors in chunks...")
-        mm_all = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
-        
-        # iterate over all rows of db in chunks
-        #TODO: Try and increase chunk size
         for start in range(0, num_records, CHUNK_SIZE):
             end = min(start + CHUNK_SIZE, num_records)
-            # array of vectors
-            chunk = np.array(mm_all[start:end], dtype=np.float32)  
+            # chunk_size = end - start
+            # offset = start * DIMENSION * 4
+            # chunk_vectors = np.memmap(
+            #     self.db_path,
+            #     dtype=np.float32,
+            #     mode="r",
+            #     shape=(chunk_size, DIMENSION),
+            #     offset = offset
+            # )
 
-            # normalize chunk
-            norms = np.linalg.norm(chunk, axis=1, keepdims=True)
-            norms[norms == 0] = 1.0
-            chunk_norm = chunk / norms  
+            chunk_vectors = db[start:end]
+            # norms = np.linalg.norm(chunk_vectors, axis=1, keepdims=True)
+            # non_zero_mask = (norms[:,0] != 0)
+            # chunk_vectors = chunk_vectors[non_zero_mask] / norms[non_zero_mask]
 
-            # compute similarity to centroids (dot product because normalized)
-            similarity_matrix = chunk_norm @ centroids.T  # shape (chunk_size, n_clusters) (how similar is each vector to all centroids)
-            chunk_cluster_ids = np.argmax(similarity_matrix, axis=1)  # Gets the nearest cluster for each vector (axis = 1) as an id (argmax)
+            similarity_matrix = chunk_vectors @ centroids.T
+            assigned_clusters = np.argmax(similarity_matrix, axis=1)
 
-            # encode PQ codes for chunk (vectorized)
-            # Similar to finding neerest cluster but we do it for each subvector within the vector and we compute euclidean distance instead of dot product since pq clusters arent normalized
-            chunk_codes = np.empty((end - start, M), dtype=np.uint8)
-            s = 0
-            for m_idx, sd in enumerate(subdims):
-                subvecs = chunk_norm[:, s:s + sd]  # shape (chunk_size, sd)
+            for local_idx, cid in enumerate(assigned_clusters):
+                gid = start + local_idx
+                cluster_files[cid].write(np.uint32(gid).tobytes())
 
-                #the clusters for this subvector
-                codebook = pq_codebooks[m_idx]  # shape (256, sd)
 
-                # compute euclidean distance between codebook and subvector
-                # For vectorized efficiency: use (a-b)^2 = a^2 + b^2 - 2a.b (av)
-                a2 = np.sum(subvecs ** 2, axis=1, keepdims=True)  # (chunk,1)
-                b2 = np.sum(codebook ** 2, axis=1)  # (256,)
-                ab = subvecs @ codebook.T  # (chunk,256)
-                # squared distances:
-                dists = a2 + b2 - 2.0 * ab  # (chunk,256)
-                nearest_codes = np.argmin(dists, axis=1).astype(np.uint8)
-                chunk_codes[:, m_idx] = nearest_codes
-                s += sd
-
-            # group bytes to write per cluster to minimize file calls
-            buffers: Dict[int, bytearray] = {}
-            counts_local: Dict[int, int] = {}
-
-            for local_idx, cid in enumerate(chunk_cluster_ids):
-                global_id = start + local_idx
-                code_bytes = chunk_codes[local_idx].tobytes()  # M bytes
-                id_bytes = struct.pack('<I', int(global_id))  # 4 bytes, little-endian unsigned int
-                if cid not in buffers:
-                    buffers[cid] = bytearray()
-                    counts_local[cid] = 0
-                buffers[cid].extend(code_bytes)
-                buffers[cid].extend(id_bytes)
-                counts_local[cid] += 1
-
-            # write buffers to files (append)
-            for cid, buff in buffers.items():
-                with open(cluster_paths[cid], "ab") as fh:
-                    fh.write(buff)
-                cluster_counts[cid] += counts_local[cid]
-
-        # Save counts
-        np.save(os.path.join(self.index_path,"cluster_counts.npy"), cluster_counts)
-        print("Index build complete. Cluster counts saved.")
+        for f in cluster_files:
+            f.close()
 
     # --------------------------- RETRIEVE (NO CACHING) --------------------------- #
-    def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=TOP_K_DEFAULT):
+    def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k):
         """
         Disk-only retrieval using IVF+PQ + ADC.
         No caching: loads centroids & PQ codebooks per call (tiny), reads cluster files sequentially.
         """
-        
+        num_records = self._get_num_records()
+        n_clusters = IVF_CONFIGS[num_records]
+        PROBE_CLUSTERS = PROBE_CLUSTERS_CONFIGS[num_records]
+
+
         # TODO: keep only reshape(-1)
         q = query.astype(np.float32).copy().reshape(-1)
         # normalize query
@@ -278,106 +196,101 @@ class VecDB:
             qnorm = 1.0
         q = q / qnorm
 
-        # Load centroids (tiny) and pq codebooks (tiny) and counts
-        centroids = np.load(self.index_path + "/centroids.npy")  # (n_clusters, DIM)
+        BATCH = 1600
+        top_clusters = []
+        for start in range(0, n_clusters, BATCH):
+            end = min(start + BATCH, n_clusters)
+            batch = np.memmap(
+                self.index_path + "/centroids.bin",
+                dtype=np.float32,
+                mode="r",
+                shape=(end - start, DIMENSION),
+                offset = start * DIMENSION * 4
+            )
+            scores = batch @ q
+            for local_idx, score in enumerate(scores):
+                cid = start + local_idx
+                heapq.heappush(top_clusters, (score, cid))
+                if len(top_clusters) > PROBE_CLUSTERS:
+                    heapq.heappop(top_clusters)
 
-        # TODO: try using pq_npz directly
-        pq_npz = np.load(self.index_path + "/pq_codebooks.npz")
-        pq_codebooks = [pq_npz[key] for key in pq_npz.files]  # list of (256, subdim)
-        cluster_counts = np.load(self.index_path + "/cluster_counts.npy")
-
-        #TODO: Remove this line
-        n_clusters = centroids.shape[0]
-
-        M = len(pq_codebooks)
-
-        # compute similarity to centroids and pick top PROBE_CLUSTERS
-        similarity_to_centroids = centroids @ q  # (n_clusters,)
-        num_records = self._get_num_records()
-        PROBE_CLUSTERS = PROBE_CLUSTERS_CONFIGS[num_records]
-        top_clusters = np.argsort(similarity_to_centroids)[-PROBE_CLUSTERS:][::-1]
-
-        # Precompute ADC tables T[m, 256]: distances between query subvector and PQ centroids
-        # define subdims same as during build
-        # compute subdims from pq_codebooks shapes
-
-        #TODO: Try to not do this whole block and just use codebook and q directly
-        subdims = [codebook.shape[1] for codebook in pq_codebooks]
-        # split query into subspaces
-        q_subs = []
-        s = 0
-        for sd in subdims:
-            q_subs.append(q[s:s + sd])
-            s += sd
-
-        # compute T
-        #TODO: make it a numpy array mel awel
-        T = []
-        for m_idx in range(M):
-            codebook = pq_codebooks[m_idx]  # (256, sd)
-            # compute squared L2 distances between q_subs[m] and all 256 centroids
-            a2 = np.sum(q_subs[m_idx] ** 2)
-            b2 = np.sum(codebook ** 2, axis=1)  # (256,)
-            ab = codebook @ q_subs[m_idx]  # (256,)
-            dists = a2 + b2 - 2.0 * ab  # (256,)
-            T.append(dists.astype(np.float32))
-        T = np.array(T)  # shape (M, 256)
-
-        # Gather candidates
-        candidates_ids = []
-        candidates_scores = []  # lower = closer in L2; we'll pick smallest distances
-
-        # For each probed cluster, read its file and compute ADC distances vectorized
-        # TODO: Try to completely remove cluster_counts 
-        for cid in top_clusters:
+        vectors = np.memmap(
+            self.db_path,
+            dtype=np.float32,
+            mode='r',
+            shape=(num_records, DIMENSION)
+        )
+        top_vectors = []
+        all_ids = []
+        for _, cid in top_clusters:
             cluster_path = f"{self.index_path}/cluster_{cid}.bin"
-            if not os.path.exists(cluster_path):
-                continue
-            count = int(cluster_counts[cid])
-            if count == 0:
-                continue
-            # read full content (sequential read)
             with open(cluster_path, "rb") as fh:
                 raw = fh.read()
-            # interpret as structured array: codes (M x uint8) + id (uint32)
-            #TODO: try to store as np format to begin with
-            dtype = np.dtype([('code', np.uint8, M), ('id', np.uint32)])
-            try:
-                arr = np.frombuffer(raw, dtype=dtype)
-            except Exception as e:
-                # in case of alignment / corruption, skip
-                continue
-            if arr.size == 0:
-                continue
+            ids = np.frombuffer(raw, dtype='<u4')
+            # ids.sort()
+            all_ids.append(ids)
+            # candidate_vectors = vectors[ids]
 
-            codes = arr['code']  # shape (count, M), dtype uint8
-            ids = arr['id'].astype(np.int64)
+            # scores = candidate_vectors @ q
+            # for score, id in zip(scores,ids):
+            #     if id == 19852040:
+            #       print(score)
+            #     heapq.heappush(top_vectors, (score, id))
 
-            # ADC: for each candidate, sum T[m, code[m]] across m
-            # Vectorized: build (count, M) from indexing
-            # T is (M, 256). For each m, T[m, codes[:, m]] -> (count,)
-            dist_sum = np.zeros(codes.shape[0], dtype=np.float32)
-            for m_idx in range(M):
-                dist_sum += T[m_idx][codes[:, m_idx]]
+            #     if len(top_vectors) > top_k:
+            #         heapq.heappop(top_vectors)
 
-            candidates_ids.append(ids)
-            candidates_scores.append(dist_sum)
+            # for id in ids:
 
-        if len(candidates_ids) == 0:
-            return []
+            #     candidate_vector = self.get_one_row(np.int64(id))
 
-        # concatenate arrays
-        all_ids = np.concatenate(candidates_ids)
-        all_scores = np.concatenate(candidates_scores)
+            #     score = candidate_vector @ q
+            #     heapq.heappush(top_vectors, (score, id))
 
-        # get top_k smallest distances
-        if all_scores.size <= top_k:
-            top_idx = np.argsort(all_scores)
-        else:
-            top_idx = np.argpartition(all_scores, top_k - 1)[:top_k]
-            top_idx = top_idx[np.argsort(all_scores[top_idx])]
+            #     if len(top_vectors) > top_k:
+            #         heapq.heappop(top_vectors)
 
-        top_ids = all_ids[top_idx].tolist()
+
+
+        all_ids = np.concatenate(all_ids)
+        all_ids.sort()
+        n_ids = len(all_ids)
+
+
+        i = 0
+        while i < n_ids:
+            start_id = all_ids[i]
+            batch_ids = [start_id]
+            j = i + 1
+            while j < n_ids and all_ids[j] - start_id < BATCH:
+                batch_ids.append(all_ids[j])
+                j += 1
+
+            offset = np.int64(start_id) * DIMENSION * 4
+            length = (batch_ids[-1] - start_id + 1)
+            mmap_batch = np.memmap(
+                self.db_path,
+                dtype=np.float32,
+                mode='r',
+                offset=offset,
+                shape=(length, DIMENSION)
+            )
+
+            local_indices = [idx - start_id for idx in batch_ids]
+            batch = mmap_batch[local_indices]
+
+            scores = batch @ q
+            for score, vec_id in zip(scores, batch_ids):
+                heapq.heappush(top_vectors, (score, vec_id))
+                if len(top_vectors) > top_k:
+                    heapq.heappop(top_vectors)
+
+            i = j
+
+
+        top_vectors.sort(key=lambda x: x[0], reverse=True)
+
+        top_ids = [id for _, id in top_vectors]
         return top_ids
 
     def _cal_score(self, vec1, vec2):

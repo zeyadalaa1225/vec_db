@@ -23,9 +23,9 @@ IVF_CONFIGS = {
 # ele howa 8aleban bardo 3add sabet 34an 3add el ivf clusters byzed ma3a el size
 # Number of clusters to probe
 PROBE_CLUSTERS_CONFIGS = {
-    1_000_000: 10,
-    10_000_000: 10,
-    20_000_000: 10
+    1_000_000: 30,
+    10_000_000: 15,
+    20_000_000: 15
 }
 
 # Chunking and sampling for build phase
@@ -36,6 +36,7 @@ class VecDB:
                  new_db=True, db_size=None, new_index = False) -> None:
         self.db_path = database_file_path
         self.index_path = index_file_path
+        self.num_records = self._get_num_records()
         os.makedirs(self.index_path, exist_ok=True)
         if new_db:
             if db_size is None:
@@ -110,31 +111,19 @@ class VecDB:
 
         print(f"Building IVF: N={num_records}, clusters={n_clusters}")
 
-        # -------------------- step 1: load data --------------------
+        # # -------------------- step 1: load data --------------------
         db = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
 
         db_magnitude = np.linalg.norm(db, axis=1, keepdims=True)
-        # non_zero_mask = (db_magnitude[:,0] != 0)
-        # db = db[non_zero_mask] / db_magnitude[non_zero_mask]
-        db_magnitude[db_magnitude == 0] = 1
-        db = db / db_magnitude
-        
+        non_zero_mask = (db_magnitude[:,0] != 0)
+        db = db[non_zero_mask] / db_magnitude[non_zero_mask]
+
         # -------------------- step 2: train IVF centroids --------------------
         print("Training MiniBatchKMeans for centroids...")
 
-        kmeans_ivf = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, batch_size=10_000, n_init="auto")
+        kmeans_ivf = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, batch_size=50_000, n_init="auto")
         kmeans_ivf.fit(db)
         centroids = kmeans_ivf.cluster_centers_.astype(np.float32)
-
-        # kmeans_ivf = KMeans(
-        #   n_clusters=n_clusters,
-        #   random_state=DB_SEED_NUMBER,
-        #   n_init="auto",
-        #   max_iter=300,
-        #   algorithm="lloyd"
-        # )
-        # kmeans_ivf.fit(sample)
-        # centroids = kmeans_ivf.cluster_centers_.astype(np.float32)
 
         c_norms = np.linalg.norm(centroids, axis=1, keepdims=True)
         centroids = centroids / c_norms
@@ -142,8 +131,8 @@ class VecDB:
         centroids.tofile(os.path.join(self.index_path, "centroids.bin"))
         print("Centroids saved.")
 
-        # # -------------------- step 3: assign vectors in chunks --------------------
-        # centroids = np.fromfile(self.index_path + "/centroids.bin", dtype=np.float32).reshape((n_clusters, DIMENSION))
+        # -------------------- step 3: assign vectors in chunks --------------------
+        centroids = np.fromfile(self.index_path + "/centroids.bin", dtype=np.float32).reshape((n_clusters, DIMENSION))
         cluster_files = [
             open(os.path.join(self.index_path, f"cluster_{cid}.bin"), "ab")
             for cid in range(n_clusters)
@@ -151,20 +140,9 @@ class VecDB:
 
         for start in range(0, num_records, CHUNK_SIZE):
             end = min(start + CHUNK_SIZE, num_records)
-            # chunk_size = end - start
-            # offset = start * DIMENSION * 4
-            # chunk_vectors = np.memmap(
-            #     self.db_path,
-            #     dtype=np.float32,
-            #     mode="r",
-            #     shape=(chunk_size, DIMENSION),
-            #     offset = offset
-            # )
+
 
             chunk_vectors = db[start:end]
-            # norms = np.linalg.norm(chunk_vectors, axis=1, keepdims=True)
-            # non_zero_mask = (norms[:,0] != 0)
-            # chunk_vectors = chunk_vectors[non_zero_mask] / norms[non_zero_mask]
 
             similarity_matrix = chunk_vectors @ centroids.T
             assigned_clusters = np.argmax(similarity_matrix, axis=1)
@@ -183,19 +161,15 @@ class VecDB:
         Disk-only retrieval using IVF+PQ + ADC.
         No caching: loads centroids & PQ codebooks per call (tiny), reads cluster files sequentially.
         """
-        num_records = self._get_num_records()
+        num_records = self.num_records
         n_clusters = IVF_CONFIGS[num_records]
         PROBE_CLUSTERS = PROBE_CLUSTERS_CONFIGS[num_records]
 
 
-        # TODO: keep only reshape(-1)
-        q = query.astype(np.float32).copy().reshape(-1)
-        # normalize query
-        qnorm = np.linalg.norm(q)
-        if qnorm == 0:
-            qnorm = 1.0
-        q = q / qnorm
+        q = query.reshape(-1)
+        q /= np.linalg.norm(q)
 
+      
         BATCH = 1600
         top_clusters = []
         for start in range(0, n_clusters, BATCH):
@@ -214,41 +188,13 @@ class VecDB:
                 if len(top_clusters) > PROBE_CLUSTERS:
                     heapq.heappop(top_clusters)
 
-        vectors = np.memmap(
-            self.db_path,
-            dtype=np.float32,
-            mode='r',
-            shape=(num_records, DIMENSION)
-        )
         top_vectors = []
         all_ids = []
+
         for _, cid in top_clusters:
             cluster_path = f"{self.index_path}/cluster_{cid}.bin"
-            with open(cluster_path, "rb") as fh:
-                raw = fh.read()
-            ids = np.frombuffer(raw, dtype='<u4')
-            # ids.sort()
+            ids = np.fromfile(cluster_path, dtype='<u4')
             all_ids.append(ids)
-            # candidate_vectors = vectors[ids]
-
-            # scores = candidate_vectors @ q
-            # for score, id in zip(scores,ids):
-            #     if id == 19852040:
-            #       print(score)
-            #     heapq.heappush(top_vectors, (score, id))
-
-            #     if len(top_vectors) > top_k:
-            #         heapq.heappop(top_vectors)
-
-            # for id in ids:
-
-            #     candidate_vector = self.get_one_row(np.int64(id))
-
-            #     score = candidate_vector @ q
-            #     heapq.heappush(top_vectors, (score, id))
-
-            #     if len(top_vectors) > top_k:
-            #         heapq.heappop(top_vectors)
 
 
 
@@ -256,16 +202,12 @@ class VecDB:
         all_ids.sort()
         n_ids = len(all_ids)
 
-
+        all_scores = []
         i = 0
         while i < n_ids:
             start_id = all_ids[i]
-            batch_ids = [start_id]
-            j = i + 1
-            while j < n_ids and all_ids[j] - start_id < BATCH:
-                batch_ids.append(all_ids[j])
-                j += 1
-
+            j = np.searchsorted(all_ids, start_id + BATCH, side='left')
+            batch_ids = all_ids[i:j]
             offset = np.int64(start_id) * DIMENSION * 4
             length = (batch_ids[-1] - start_id + 1)
             mmap_batch = np.memmap(
@@ -276,17 +218,15 @@ class VecDB:
                 shape=(length, DIMENSION)
             )
 
-            local_indices = [idx - start_id for idx in batch_ids]
-            batch = mmap_batch[local_indices]
+            batch = mmap_batch[(batch_ids - start_id)]
 
-            scores = batch @ q
-            for score, vec_id in zip(scores, batch_ids):
+            batch_scores = batch @ q
+            for score, vec_id in zip(batch_scores, batch_ids):
                 heapq.heappush(top_vectors, (score, vec_id))
                 if len(top_vectors) > top_k:
                     heapq.heappop(top_vectors)
 
             i = j
-
 
         top_vectors.sort(key=lambda x: x[0], reverse=True)
 

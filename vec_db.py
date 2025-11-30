@@ -1,17 +1,15 @@
-from typing import Annotated, Dict
+from typing import Annotated
 import numpy as np
 import os
-import struct
-from sklearn.cluster import KMeans, MiniBatchKMeans
+from sklearn.cluster import  MiniBatchKMeans
 import heapq
-import gc
 
 ELEMENT_SIZE = np.dtype(np.float32).itemsize
 DIMENSION = 64
 DB_SEED_NUMBER = 42
 
 
-# IVF number of clusters based on db size
+# n_clusters based on database size
 IVF_CONFIGS = {
     1_000_000: 4096,
     10_000_000: 8192,
@@ -19,9 +17,7 @@ IVF_CONFIGS = {
 }
 
 
-## de mesh mofeda zeyadetha asl wana batrain batrain 3ala 500000 kda kda fa mesh hyfe2 we wana baretrieve be retreive 3ala probe_cluster fe 3add el el data ele gowa kol cluster
-# ele howa 8aleban bardo 3add sabet 34an 3add el ivf clusters byzed ma3a el size
-# Number of clusters to probe
+# n_probe based on database size
 PROBE_CLUSTERS_CONFIGS = {
     1_000_000: 30,
     10_000_000: 15,
@@ -88,21 +84,14 @@ class VecDB:
         vectors = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
         return np.array(vectors)
 
-    # --------------------------- INDEX BUILD: IVF + PQ --------------------------- #
+    # --------------------------- INDEX BUILD: IVF --------------------------- #
     def _choose_n_clusters(self, num_records):
         # pick nearest config
         closest = min(IVF_CONFIGS.keys(), key=lambda x: abs(x - num_records))
         return IVF_CONFIGS[closest]
 
     def _build_index(self):
-        """
-        Build IVF + PQ index from on-disk vectors.
-        - Centroids saved to index_path_centroids.npy
-        - PQ codebooks saved to index_path_pq.npy (shape: list of arrays or stacked)
-        - Per-cluster inverted lists saved to index_path_cluster_{cid}.bin
-          Each entry in cluster file: struct of M uint8 (code) followed by uint32 (vector id)
-        - cluster_counts saved to index_path_cluster_counts.npy
-        """
+
         num_records = self._get_num_records()
         if num_records == 0:
             raise RuntimeError("No vectors to index")
@@ -132,7 +121,6 @@ class VecDB:
         print("Centroids saved.")
 
         # -------------------- step 3: assign vectors in chunks --------------------
-        centroids = np.fromfile(self.index_path + "/centroids.bin", dtype=np.float32).reshape((n_clusters, DIMENSION))
         cluster_files = [
             open(os.path.join(self.index_path, f"cluster_{cid}.bin"), "ab")
             for cid in range(n_clusters)
@@ -155,21 +143,19 @@ class VecDB:
         for f in cluster_files:
             f.close()
 
-    # --------------------------- RETRIEVE (NO CACHING) --------------------------- #
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k):
-        """
-        Disk-only retrieval using IVF+PQ + ADC.
-        No caching: loads centroids & PQ codebooks per call (tiny), reads cluster files sequentially.
-        """
+
+        # Initialize Parameters
         num_records = self.num_records
         n_clusters = IVF_CONFIGS[num_records]
         PROBE_CLUSTERS = PROBE_CLUSTERS_CONFIGS[num_records]
 
-
+        # Normalize Query
         q = query.reshape(-1)
         q /= np.linalg.norm(q)
 
       
+        # Batch load Centroids and compute similarity between batch and query
         BATCH = 1600
         top_clusters = []
         for start in range(0, n_clusters, BATCH):
@@ -182,6 +168,8 @@ class VecDB:
                 offset = start * DIMENSION * 4
             )
             scores = batch @ q
+
+            # Keep only the highest n_probe (PROBE_CLUSTERS) centroid scores usnig minheap
             for local_idx, score in enumerate(scores):
                 cid = start + local_idx
                 heapq.heappush(top_clusters, (score, cid))
@@ -191,18 +179,21 @@ class VecDB:
         top_vectors = []
         all_ids = []
 
+        # Probe the top n_probe centroids and retrieve their vector ids
         for _, cid in top_clusters:
             cluster_path = f"{self.index_path}/cluster_{cid}.bin"
             ids = np.fromfile(cluster_path, dtype='<u4')
             all_ids.append(ids)
 
 
+        # Sort for sequential I/O
 
         all_ids = np.concatenate(all_ids)
         all_ids.sort()
         n_ids = len(all_ids)
 
-        all_scores = []
+
+        # Batch the ids in a given range so that they belong to the same page
         i = 0
         while i < n_ids:
             start_id = all_ids[i]
@@ -221,6 +212,8 @@ class VecDB:
             batch = mmap_batch[(batch_ids - start_id)]
 
             batch_scores = batch @ q
+
+            # keep the vectors with the top k scores only
             for score, vec_id in zip(batch_scores, batch_ids):
                 heapq.heappush(top_vectors, (score, vec_id))
                 if len(top_vectors) > top_k:

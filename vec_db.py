@@ -194,7 +194,6 @@ class VecDB:
 
 
         # Batch the ids in a given range so that they belong to the same page
-        BATCH = 1600
         i = 0
         while i < n_ids:
             start_id = all_ids[i]

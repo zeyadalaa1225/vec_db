@@ -24,7 +24,7 @@ PROBE_CLUSTERS_CONFIGS = {
     20_000_000: 15
 }
 
-# Chunking and sampling for build phase
+# Batch Size of vector assignment to centroid during build
 CHUNK_SIZE = 5_000
 
 class VecDB:
@@ -110,7 +110,7 @@ class VecDB:
         # -------------------- step 2: train IVF centroids --------------------
         print("Training MiniBatchKMeans for centroids...")
 
-        kmeans_ivf = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, batch_size=50_000, n_init="auto")
+        kmeans_ivf = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, batch_size=10_000, n_init="auto")
         kmeans_ivf.fit(db)
         centroids = kmeans_ivf.cluster_centers_.astype(np.float32)
 
@@ -194,6 +194,7 @@ class VecDB:
 
 
         # Batch the ids in a given range so that they belong to the same page
+        BATCH = 3200
         i = 0
         while i < n_ids:
             start_id = all_ids[i]
